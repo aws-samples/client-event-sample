@@ -1,4 +1,4 @@
-# Client event capture using EventBridge
+# Client event capture using EventBridge and API Gateway
 
 ## Overview
 
