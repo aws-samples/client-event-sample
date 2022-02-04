@@ -1,0 +1,621 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  client_events
+
+  SAM Template for EventBridge Client Events Pipeline
+
+Parameters:
+  ZendeskEndpoint:
+    Type: String
+    Description: Endpoint for your Zendesk ticket request
+
+# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
+Globals:
+  Function:
+    Timeout: 10
+    MemorySize: 512
+    Runtime: python3.9
+
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      AliasAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      EmailConfiguration:
+        EmailSendingAccount: COGNITO_DEFAULT
+      Schema:
+        - Name: clientId
+          AttributeDataType: String
+          Mutable: true
+          Required: false
+      LambdaConfig:
+        PostConfirmation: !GetAtt PostConfirmFunction.Arn
+      UserPoolAddOns:
+        AdvancedSecurityMode: ENFORCED
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 3
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      GenerateSecret: false
+      UserPoolId: !Ref UserPool
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        
+  PostConfirmationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      RetentionInDays: 7
+      LogGroupName: !Join ["", ["/aws/lambda/", !Ref PostConfirmFunction]]
+
+        
+  PostConfirmTriggerPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Join [ "", [!Ref "AWS::StackName", "-postconfirmtriggerpolicy"] ]
+      Roles:
+        - !Ref PostConfirmTriggerRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Action: "cognito-idp:AdminUpdateUserAttributes"
+            Resource: !GetAtt UserPool.Arn
+          - Effect: "Allow"
+            Action: 
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: !GetAtt PostConfirmationLogGroup.Arn
+        
+  PostConfirmTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Post Confirm Trigger Role to Add ClientID
+      RoleName: !Join [ "", [!Ref "AWS::StackName", "clientevents.postconfirmtrigger"] ]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'      
+
+  PostConfirmFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/postconfirm
+      Handler: app.lambda_handler
+      Role: !GetAtt PostConfirmTriggerRole.Arn
+      Timeout: 5
+
+  UserPoolLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:invokeFunction
+      Principal: cognito-idp.amazonaws.com
+      FunctionName: !Ref PostConfirmFunction
+      SourceArn: !GetAtt UserPool.Arn
+
+  AuthorizerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      RetentionInDays: 7
+      LogGroupName: !Join ["", ["/aws/lambda/", !Ref AuthorizerFunction]]
+
+  AuthorizerPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Join [ "", [!Ref "AWS::StackName", "-authorizerpolicy"] ]
+      Roles:
+        - !Ref AuthorizerRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Action: 
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: !GetAtt AuthorizerLogGroup.Arn
+
+  AuthorizerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Authorizer Role
+      RoleName: !Join [ "", [!Ref "AWS::StackName", "clientevents.authorizer"] ]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'      
+
+  AuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/authorizer
+      Handler: authorizer.lambda_handler
+      Role: !GetAtt AuthorizerRole.Arn
+      FunctionName: ClientEventsAuthorizerFunction
+      Environment:
+        Variables:
+          USERPOOLID: !Ref UserPool
+          REGION: !Sub ${AWS::Region}
+          APPCLIENTID: !Ref UserPoolClient
+      
+  ClientEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: client_event_bus
+
+  APIGWPutEventsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: API Gateway PutEvents role
+      RoleName: !Join [ "", [!Ref "AWS::StackName", "clientevents.apigatewayputevents"] ]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'   
+
+  APIGWPutEventsPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Join [ "", [!Ref "AWS::StackName", "apigatewayputeventspolicy"] ]
+      Roles:
+        - !Ref APIGWPutEventsRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Action: "events:PutEvents"
+            Resource: !GetAtt ClientEventBus.Arn
+
+  EventAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: ClientEventsAPI
+      EndpointConfiguration: 
+        Types:
+          - REGIONAL
+      Body: 
+        swagger: 2.0
+        info:
+          title: "EBClientEvents"
+        schemes:
+        - "https"
+        paths:
+          /event:
+            post:
+              consumes:
+              - "application/json"
+              produces:
+              - "application/json"
+              parameters:
+              - in: "body"
+                name: "Events"
+                required: true
+                schema:
+                  $ref: "#/definitions/Events"              
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+              security:
+              - auth: []
+              x-amazon-apigateway-request-validator: "Validate body"
+              x-amazon-apigateway-integration:
+                credentials: !GetAtt APIGWPutEventsRole.Arn
+                httpMethod: "POST"
+                uri: !Sub "arn:aws:apigateway:${AWS::Region}:events:action/PutEvents"
+                responses:
+                  default:
+                    statusCode: "200"
+                requestTemplates:
+                  application/json: "#set($context.requestOverride.header.X-Amz-Target = \"\
+                    AWSEvents.PutEvents\")\n#set($context.requestOverride.header.Content-Type\
+                    \ = \"application/x-amz-json-1.1\")            \n#set($inputRoot = $input.path('$'))\
+                    \ \n{ \n\"Entries\": [\n  #foreach($elem in $inputRoot.entries)\n  {\n\
+                    \    \"Resources\": [\"$context.authorizer.clientId\"],\n    \"Detail\"\
+                    : \"$util.escapeJavaScript($elem.entry)\",\n    \"DetailType\": \"$stageVariables.Environment\"\
+                    ,\n    \"EventBusName\": \"$stageVariables.Bus\",\n    \"Source\":\"clientevents\"\
+                    \n  }#if($foreach.hasNext),#end\n  #end\n]\n}"
+                passthroughBehavior: "when_no_templates"
+                type: "aws"
+        securityDefinitions:
+          auth:
+            type: "apiKey"
+            name: "Authorization"
+            in: "header"
+            x-amazon-apigateway-authtype: "custom"
+            x-amazon-apigateway-authorizer:
+              authorizerUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:ClientEventsAuthorizerFunction/invocations"
+              authorizerResultTtlInSeconds: 0
+              type: "token"
+        definitions:
+          Empty:
+            type: "object"
+            title: "Empty Schema"
+          Events:
+            type: "object"
+            properties:
+              entries:
+                type: "array"
+            title: "EventsInputModel"
+        x-amazon-apigateway-request-validators:
+          Validate body:
+            validateRequestParameters: false
+            validateRequestBody: true
+
+  AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      RetentionInDays: 7
+      LogGroupName: !Join ["", ["/aws/apigw/", !Ref EventAPI]]
+  
+#  EventAPIStage:
+#    Type: AWS::ApiGateway::Stage
+#    Properties:
+#      DeploymentId: !Ref EventAPIDeployment
+#      RestApiId: !Ref EventAPI
+#      StageName: prod
+
+  EventAPIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref EventAPI
+      StageName: prod
+      StageDescription:
+        AccessLogSetting:
+          DestinationArn: !GetAtt AccessLogGroup.Arn
+          Format: $context.identity.sourceIp $context.identity.caller $context.identity.user [$context.requestTime] "$context.httpMethod $context.resourcePath $context.protocol" $context.status $context.responseLength $context.requestId $context.extendedRequestId
+        Variables:
+          Bus: !Ref ClientEventBus
+          Environment: prod
+        Description: prod
+        LoggingLevel: INFO
+        MetricsEnabled: True
+
+  AuthorizerLambdaPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+    - EventAPI
+    - AuthorizerFunction
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AuthorizerFunction
+      Principal: apigateway.amazonaws.com
+
+  TransformerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Transformer Role
+      RoleName: !Join [ "", [!Ref "AWS::StackName", "clientevents.transformer"] ]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+
+  TransformerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      RetentionInDays: 7
+      LogGroupName: !Join ["", ["/aws/lambda/", !Ref TransformationFunction]]
+
+  TransformerPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Join [ "", [!Ref "AWS::StackName", "-transformerpolicy"] ]
+      Roles:
+        - !Ref TransformerRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action: 
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: !GetAtt TransformerLogGroup.Arn
+
+  TransformationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/transformer
+      Handler: app.lambda_handler
+      Timeout: 61
+      Role: !GetAtt TransformerRole.Arn
+      
+  KinesisFirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Kinesis Firehose Role for Client Events
+      RoleName: !Join [ "", [!Ref "AWS::StackName", "clientevents.firehose"] ]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - firehose.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'      
+
+  FirehoseTransformPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Join [ "", [!Ref "AWS::StackName", "clienteventsfirehose"] ]
+      Roles:
+        - !Ref KinesisFirehoseRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Action: 
+              - "s3:AbortMultipartUpload"
+              - "s3:GetBucketLocation"
+              - "s3:GetObject"
+              - "s3:ListBucket"
+              - "s3:ListBucketMultipartUploads"
+              - "s3:PutObject"
+            Resource:
+              - !GetAtt ClientEventsBucket.Arn
+              - !Join [ "", [!GetAtt ClientEventsBucket.Arn, "/*" ] ]
+          - Effect: "Allow"
+            Action: 
+              - "lambda:InvokeFunction"
+              - "lambda:GetFunctionConfiguration"
+            Resource: 
+              - !Join ["", [!GetAtt TransformationFunction.Arn, ":$LATEST"] ]
+
+  ClientEventsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}${AWS::AccountId}clientevents"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: "aws:kms"
+              KMSMasterKeyID: "aws/s3"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  
+  ClientEventsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ClientEventsBucket
+      PolicyDocument:
+        Statement:
+          - Action: 's3:*'
+            Effect: 'Deny'
+            Condition:
+              'Bool':
+                'aws:SecureTransport': 'false'
+            Principal: '*'
+            Resource: 
+              - !Sub 'arn:${AWS::Partition}:s3:::${ClientEventsBucket}'
+              - !Sub 'arn:${AWS::Partition}:s3:::${ClientEventsBucket}/*'
+
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}${AWS::AccountId}loggingbucket"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: "aws:kms"
+              KMSMasterKeyID: "aws/s3"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  LoggingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LoggingBucket
+      PolicyDocument:
+        Statement:
+          - Action: 's3:*'
+            Effect: 'Deny'
+            Condition:
+              'Bool':
+                'aws:SecureTransport': 'false'
+            Principal: '*'
+            Resource: 
+              - !Sub 'arn:${AWS::Partition}:s3:::${LoggingBucket}'
+              - !Sub 'arn:${AWS::Partition}:s3:::${LoggingBucket}/*'
+        
+  Firehose:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: clienteventsfirehose
+      DeliveryStreamType: DirectPut
+      DeliveryStreamEncryptionConfigurationInput:
+        KeyType: AWS_OWNED_CMK
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt ClientEventsBucket.Arn
+        Prefix: "!{partitionKeyFromQuery:eventType}/!{partitionKeyFromQuery:schemaVersion}/"
+        ErrorOutputPrefix: "error/"
+        RoleARN: !GetAtt KinesisFirehoseRole.Arn
+        DynamicPartitioningConfiguration:
+          Enabled: True
+        EncryptionConfiguration:
+          KMSEncryptionConfig:
+            AWSKMSKeyARN: !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3"
+        ProcessingConfiguration:
+          Enabled: True
+          Processors:
+            - Type: Lambda
+              Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !Join [":" , [!GetAtt TransformationFunction.Arn, "$LATEST"]]
+                - ParameterName: NumberOfRetries
+                  ParameterValue: 3
+                - ParameterName: RoleArn
+                  ParameterValue: !GetAtt KinesisFirehoseRole.Arn
+                - ParameterName: BufferSizeInMBs
+                  ParameterValue: 3
+                - ParameterName: BufferIntervalInSeconds
+                  ParameterValue: 60
+            - Type: RecordDeAggregation
+              Parameters:
+                - ParameterName: SubRecordType
+                  ParameterValue: JSON
+            - Type: MetadataExtraction
+              Parameters:
+                - ParameterName: MetadataExtractionQuery
+                  ParameterValue: "{eventType:.detail.eventType,schemaVersion:.detail.schemaVersion}"
+                - ParameterName: JsonParsingEngine
+                  ParameterValue: JQ-1.6
+                  
+  EventBridgeToFirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: EventBridge to Kinesis Firehose
+      RoleName: !Join [ "", [!Ref "AWS::StackName", "clientevents.eventbridgetofh"] ]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'      
+
+  EventBridgeToFirehosePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Join [ "", [!Ref "AWS::StackName", "clienteventsebfhpolicy"] ]
+      Roles:
+        - !Ref EventBridgeToFirehoseRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Action: 
+                - "firehose:PutRecord"
+                - "firehose:PutRecordBatch"
+            Resource:
+              - !GetAtt Firehose.Arn
+
+  EventsToFirehoseRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: !Ref ClientEventBus
+      EventPattern: { "source" : ["clientevents"] }
+      Targets:
+        - Arn: !GetAtt Firehose.Arn
+          Id: KinesisFirehose
+          InputTransformer:
+            InputPathsMap: {}
+            InputTemplate: "<aws.events.event>\n"
+          RoleArn: !GetAtt EventBridgeToFirehoseRole.Arn
+
+  EventsToAPIDestinationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join [ "", [!Ref "AWS::StackName", "clientevents.eventbridgetoapi"] ]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole      
+
+  EventBridgeToApiPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Join [ "", [!Ref "AWS::StackName", "eventbridgetoAPI"] ]
+      Roles:
+        - !Ref EventsToAPIDestinationRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement: 
+              - Effect: Allow
+                Action: 'events:InvokeApiDestination'
+                Resource: !GetAtt ZendeskDestination.Arn
+
+  SalesRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: !Ref ClientEventBus
+      EventPattern: { "source" : ["clientevents"], "detail": { "eventType": ["loyaltypurchase"] } }
+      Targets:
+        - Id: "Zendesk"
+          InputPath: $.detail.ticket
+          RoleArn: !GetAtt EventsToAPIDestinationRole.Arn
+          Arn: !GetAtt ZendeskDestination.Arn
+          HttpParameters:
+            HeaderParameters:
+              Content-Type: application/json
+
+  ZendeskConnection:
+    Type: AWS::Events::Connection
+    Properties:
+      Description: "Connection to ZenDesk"
+      AuthorizationType: "BASIC"
+      Name: "ZenDesk"
+      AuthParameters:
+        BasicAuthParameters:
+          Username: '{{resolve:secretsmanager:proto/zendesk:SecretString:username}}'
+          Password: '{{resolve:secretsmanager:proto/zendesk:SecretString:apiToken}}'
+  
+  ZendeskDestination:
+    Type: AWS::Events::ApiDestination
+    Properties:
+      ConnectionArn: !GetAtt ZendeskConnection.Arn
+      HttpMethod: POST
+      InvocationEndpoint: !Ref ZendeskEndpoint
+      InvocationRateLimitPerSecond: 10            
+      Name: Zendesk
+          
+Outputs:
+  APPCLIENTID:
+    Description: Application Client ID
+    Value: !Ref UserPoolClient
+  APIID:
+    Description: API Gateway ID
+    Value: !Ref EventAPI
+  AnayticsBucket:
+    Description: S3 Bucket for EventBridge Events
+    Value: !Ref ClientEventsBucket
+  LoggingBucket:
+    Description: S3 Bucket for Access Logging
+    Value: !Ref LoggingBucket

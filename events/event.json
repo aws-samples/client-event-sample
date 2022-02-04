@@ -1,0 +1,8 @@
+{
+    "entries": [
+        {"entry": "{\"analyticType\": \"shopping\", \"schemaVersion\":1, \"data\": {\"itemSku\":123}}"},
+        {"entry": "{\"analyticType\": \"searching\", \"schemaVersion\":1, \"data\": {\"searchTerm\":\"games\"}}"},
+        {"entry": "{\"analyticType\": \"paging\", \"schemaVersion\":2, \"data\": {\"searchTerm\":\"games\", \"page\": 2}}"},
+        {"entry": "{\"analyticType\": \"paging\", \"schemaVersion\":2 ,\"data\": {\"searchTerm\":\"games\", \"page\": 3}}"}
+    ]
+}

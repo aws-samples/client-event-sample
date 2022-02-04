@@ -1,0 +1,5 @@
+cfn_nag.output
+bandit*.output
+.aws-sam/*
+samconfig.toml
+.DS_Store
