@@ -275,13 +275,6 @@ Resources:
     Properties: 
       RetentionInDays: 7
       LogGroupName: !Join ["", ["/aws/apigw/", !Ref EventAPI]]
-  
-#  EventAPIStage:
-#    Type: AWS::ApiGateway::Stage
-#    Properties:
-#      DeploymentId: !Ref EventAPIDeployment
-#      RestApiId: !Ref EventAPI
-#      StageName: prod
 
   EventAPIDeployment:
     Type: AWS::ApiGateway::Deployment
